@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">LAN Audio</string>
+    <string name="notif_channel">声音传输</string>
+    <string name="notif_title">LAN Audio 正在运行</string>
+</resources>

@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LAN Audio · 电脑端</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo"></span>
+    <div>
+      <h1>LAN Audio</h1>
+      <p>局域网声音互传 · 电脑端</p>
+    </div>
+  </div>
+  <div class="top-status">
+    <div class="pill" id="roomPill">房间 <b id="roomCode">----</b></div>
+    <div class="pill" id="linkPill"><span class="dot" id="linkDot"></span><span id="linkText">连接中…</span></div>
+    <div class="pill" id="peerPill"><span class="dot" id="peerDot"></span><span id="peerText">手机未连接</span></div>
+  </div>
+</header>
+
+<main>
+  <section class="card">
+    <div class="card-head">
+      <h2>发送到手机</h2>
+      <span class="badge" id="sendBadge">未发送</span>
+    </div>
+    <p class="hint">系统声音 / 标签页声音需要 <b>Edge 或 Chrome</b>（Windows）。Firefox 无法捕获系统音轨，但可以接收手机声音。</p>
+    <div class="btn-row">
+      <button class="btn primary" id="btnSystem">共享系统 / 标签页声音</button>
+      <button class="btn" id="btnMic">使用麦克风</button>
+      <button class="btn ghost" id="btnStopSend" disabled>停止发送</button>
+    </div>
+    <div class="meters">
+      <div class="meter"><span>发送电平</span><div class="bar"><i id="sendBar"></i></div><em id="sendPeak">-∞ dB</em></div>
+    </div>
+    <p class="micro" id="sourceInfo">未选择音源</p>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>电脑麦克风本地监听</h2>
+      <span class="badge" id="monitorBadge">关闭</span>
+    </div>
+    <p class="hint">只在本机扬声器/耳机播放，<b>不会发送给手机</b>。用扬声器时可能啸叫，建议戴耳机。</p>
+    <div class="btn-row">
+      <button class="btn" id="btnMonitor">开启监听</button>
+      <label class="switch"><input type="checkbox" id="monitorMute"><span></span>静音</label>
+    </div>
+    <div class="slider-row">
+      <label for="monitorVolume">监听音量</label>
+      <input type="range" id="monitorVolume" min="0" max="300" value="70">
+      <b id="monitorVolumeVal">70%</b>
+    </div>
+    <div class="slider-row">
+      <label for="monitorNr">监听降噪</label>
+      <input type="range" id="monitorNr" min="0" max="100" value="40">
+      <b id="monitorNrVal">40%</b>
+    </div>
+    <p class="micro">首次使用需允许浏览器麦克风权限；同一 localhost 端口通常只询问一次。</p>
+    <p class="micro" id="monitorInfo">未开启</p>
+  </section>
+
+  <section class="card wide" id="hotkeyCard">
+    <div class="card-head">
+      <h2>全局快捷键</h2>
+      <span class="badge" id="hotkeyBadge">加载中</span>
+    </div>
+    <p class="hint">点击输入框后直接按组合键；留空表示禁用。目标键默认 <b>Alt+P</b>（全局）、<b>Alt+0</b>（设备 1）、<b>Alt+9</b>（设备 2），其余动作键默认留空。</p>
+    <div id="hotkeyForm" class="hotkey-form"></div>
+    <div class="btn-row">
+      <button class="btn" id="btnSaveHotkeys">保存快捷键</button>
+      <button class="btn ghost" id="btnReloadHotkeys">重新读取</button>
+    </div>
+    <p class="micro" id="hotkeyStatusText">正在读取…</p>
+    <p class="micro" id="activeTargetText"></p>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>接收手机声音</h2>
+      <span class="badge" id="recvBadge">等待音频</span>
+    </div>
+    <div class="btn-row">
+      <label class="switch"><input type="checkbox" id="playToggle" checked><span></span>播放手机声音</label>
+      <button class="btn ghost small" id="btnEnableAudio">启用音频输出</button>
+    </div>
+    <div class="meters">
+      <div class="meter"><span>接收电平</span><div class="bar"><i id="recvBar"></i></div><em id="recvPeak">-∞ dB</em></div>
+    </div>
+    <div class="slider-row">
+      <label for="playVolume">播放音量</label>
+      <input type="range" id="playVolume" min="0" max="100" value="80">
+      <b id="playVolumeVal">80%</b>
+    </div>
+    <p class="warn hidden" id="duplexWarn">检测到系统声音共享：已自动静音本地播放以防止回环。戴耳机或选择“标签页”共享时可开启全双工。</p>
+  </section>
+
+  <section class="card wide" id="phonesCard">
+    <div class="card-head">
+      <h2>已连接手机</h2>
+      <span class="badge" id="phonesBadge">0 台</span>
+    </div>
+    <p class="hint">多台手机的声音会自动混音到电脑。每台可单独静音、调音量、调麦克风增益、放左/右声道、调本机接收缓冲或断开。</p>
+    <div class="phone-list" id="phoneList">
+      <p class="micro" id="phoneEmpty">暂无手机连接。手机 App 填同一个电脑 IP 和房间码即可加入。</p>
+    </div>
+  </section>
+
+  <section class="card wide">
+    <div class="card-head">
+      <h2>音频设置</h2>
+      <span class="badge" id="fmtBadge">48 kHz · 立体声</span>
+    </div>
+    <div class="grid-4">
+      <div class="field">
+        <label for="sampleRate">采样率</label>
+        <select id="sampleRate">
+          <option value="48000">48 kHz · 音乐</option>
+          <option value="24000">24 kHz · 标准</option>
+          <option value="16000">16 kHz · 语音</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="channels">声道</label>
+        <select id="channels">
+          <option value="2">立体声</option>
+          <option value="1">单声道</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="sendGain">发送增益</label>
+        <input type="range" id="sendGain" min="0" max="200" value="100">
+        <b id="sendGainVal">100%</b>
+      </div>
+      <div class="field">
+        <label for="bufferMs">全局缓冲（改所有设备）</label>
+        <input type="range" id="bufferMs" min="20" max="400" step="5" value="90">
+        <b id="bufferMsVal">90 ms</b>
+      </div>
+    </div>
+
+    <div class="grid-3">
+      <div class="field">
+        <label for="duplex">双向模式</label>
+        <select id="duplex">
+          <option value="auto">自动半双工（防回环）</option>
+          <option value="full">全双工（需耳机 / 标签页）</option>
+        </select>
+      </div>
+      <label class="check"><input type="checkbox" id="echoCancellation" checked>回声消除（麦克风）</label>
+      <label class="check"><input type="checkbox" id="noiseSuppression" checked>降噪（麦克风）</label>
+      <label class="check"><input type="checkbox" id="balanceBuffer" checked>平衡缓冲（多设备统一取最大）</label>
+    </div>
+  </section>
+
+  <section class="card wide">
+    <div class="card-head">
+      <h2>连接状态</h2>
+      <span class="badge" id="qualityBadge">—</span>
+    </div>
+    <div class="stats">
+      <div><span>延迟</span><b id="statRtt">—</b></div>
+      <div><span>发送码率</span><b id="statUp">0 kbps</b></div>
+      <div><span>接收码率</span><b id="statDown">0 kbps</b></div>
+      <div><span>接收缓冲</span><b id="statBuf">0 ms</b></div>
+      <div><span>缓冲欠载</span><b id="statUnder">0</b></div>
+      <div><span>丢帧</span><b id="statDrop">0</b></div>
+    </div>
+    <div class="log" id="log" aria-live="polite"></div>
+  </section>
+</main>
+
+<footer>
+  <span>手机端：安装 <b>LAN Audio APK</b>，与电脑处于同一 Wi-Fi，点“开始”即可自动发现。</span>
+  <span>电脑首次运行如弹出防火墙提示，请允许专用网络访问。</span>
+</footer>
+
+<script src="/app.js"></script>
+</body>
+</html>

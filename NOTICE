@@ -1,0 +1,40 @@
+LAN Audio
+Copyright (c) 2026 CD47
+
+This software is licensed under the PolyForm Noncommercial License 1.0.0.
+See the LICENSE file for the full terms.
+
+## Attribution requirement
+
+If you modify, fork, or redistribute this software or a work based on it,
+you must keep this NOTICE file and the copyright notice above, and clearly
+state:
+
+- the original project: LAN Audio by CD47
+- a link to the original repository
+- that your version has been modified
+- who made the changes
+
+## Commercial use
+
+Commercial use is not permitted by the license. If you want to use this
+software commercially, you need a separate written license from CD47.
+
+## Third-party components
+
+This project depends on the following third-party software. Their licenses
+apply to those components, not to this project's own source code.
+
+| Component | License | Used by |
+|---|---|---|
+| Node.js | MIT | PC backend runtime |
+| ws | MIT | PC backend WebSocket library |
+| OkHttp | Apache-2.0 | Android app HTTP/WebSocket |
+| Okio | Apache-2.0 | OkHttp dependency |
+| Kotlin standard library | Apache-2.0 | Android app |
+| AndroidX / Material Components | Apache-2.0 | Android app UI |
+| Gradle | Apache-2.0 | Build tooling only |
+| Android SDK build tools | Apache-2.0 | Build tooling only |
+
+PolyForm Noncommercial is not an OSI-approved open source license, so this
+project is "source available" rather than open source in the OSI sense.

@@ -1,0 +1,45 @@
+# ---------- Node ----------
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ---------- Build output ----------
+release/
+dist/
+lanaudio-sea-blob.blob
+tools/sea/out/
+*.exe
+
+# ---------- Android ----------
+android/.gradle/
+android/.kotlin/
+android/build/
+android/app/build/
+android/local.properties
+android/app/release/
+*.apk
+*.apk.idsig
+*.aab
+*.jks
+*.keystore
+*.p12
+key.properties
+
+# ---------- Signing / secrets ----------
+.env
+.env.*
+
+# ---------- Logs / temp ----------
+*.log
+tools/tmp-*
+*.tmp
+
+# ---------- Editors / OS ----------
+.idea/
+*.iml
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
