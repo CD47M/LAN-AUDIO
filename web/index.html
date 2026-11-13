@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>LAN Audio · 电脑端</title>
-<link rel="stylesheet" href="/style.css">
+<link rel="stylesheet" href="/style.css?v=16">
 </head>
 <body>
 <header class="topbar">
@@ -16,13 +16,46 @@
     </div>
   </div>
   <div class="top-status">
+    <div class="pill" id="pagePill"><span class="dot" id="pageDot"></span><span id="pageText">前端 1/1</span></div>
     <div class="pill" id="roomPill">房间 <b id="roomCode">----</b></div>
     <div class="pill" id="linkPill"><span class="dot" id="linkDot"></span><span id="linkText">连接中…</span></div>
     <div class="pill" id="peerPill"><span class="dot" id="peerDot"></span><span id="peerText">手机未连接</span></div>
   </div>
 </header>
 
+<div class="secondary-banner hidden" id="secondaryBanner">
+  <b>此页面只读</b>
+  <span id="secondaryMsg">已经有一个前端在控制声音。多个前端同时播放会导致音量失效、声音叠加。</span>
+  <span class="secondary-actions">请关闭这个标签页，回到原来那个前端。</span>
+  <span class="micro" id="secondaryCount"></span>
+</div>
+
 <main>
+  <section class="card player-card">
+    <div class="card-head">
+      <h2>接收手机声音</h2>
+      <span class="badge" id="recvBadge">等待音频</span>
+    </div>
+
+    <div class="master-row">
+      <button class="btn primary big" id="btnPlayToggle">正在播放</button>
+      <div class="master-vol">
+        <div class="master-vol-head">
+          <label for="playVolume">总音量</label>
+          <b id="playVolumeVal">80%</b>
+        </div>
+        <input type="range" id="playVolume" class="range-lg" min="0" max="100" value="80">
+      </div>
+    </div>
+
+    <div class="meters">
+      <div class="meter"><span>接收电平</span><div class="bar"><i id="recvBar"></i></div><em id="recvPeak">-∞ dB</em></div>
+    </div>
+
+    <p class="micro" id="audioEngineState">音频引擎未启动</p>
+    <p class="warn hidden" id="duplexWarn">检测到系统声音共享：已自动静音本地播放以防止回环。戴耳机或选择“标签页”共享时可开启全双工。</p>
+  </section>
+
   <section class="card">
     <div class="card-head">
       <h2>发送到手机</h2>
@@ -77,26 +110,6 @@
     </div>
     <p class="micro" id="hotkeyStatusText">正在读取…</p>
     <p class="micro" id="activeTargetText"></p>
-  </section>
-
-  <section class="card">
-    <div class="card-head">
-      <h2>接收手机声音</h2>
-      <span class="badge" id="recvBadge">等待音频</span>
-    </div>
-    <div class="btn-row">
-      <label class="switch"><input type="checkbox" id="playToggle" checked><span></span>播放手机声音</label>
-      <button class="btn ghost small" id="btnEnableAudio">启用音频输出</button>
-    </div>
-    <div class="meters">
-      <div class="meter"><span>接收电平</span><div class="bar"><i id="recvBar"></i></div><em id="recvPeak">-∞ dB</em></div>
-    </div>
-    <div class="slider-row">
-      <label for="playVolume">播放音量</label>
-      <input type="range" id="playVolume" min="0" max="100" value="80">
-      <b id="playVolumeVal">80%</b>
-    </div>
-    <p class="warn hidden" id="duplexWarn">检测到系统声音共享：已自动静音本地播放以防止回环。戴耳机或选择“标签页”共享时可开启全双工。</p>
   </section>
 
   <section class="card wide" id="phonesCard">
@@ -179,6 +192,6 @@
   <span>电脑首次运行如弹出防火墙提示，请允许专用网络访问。</span>
 </footer>
 
-<script src="/app.js"></script>
+<script src="/app.js?v=16"></script>
 </body>
 </html>

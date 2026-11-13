@@ -120,6 +120,35 @@ h1 {
 .dot.warn { background: var(--warn); box-shadow: 0 0 12px rgba(255, 190, 92, .8); }
 .dot.bad { background: var(--danger); box-shadow: 0 0 12px rgba(255, 107, 107, .7); }
 
+.pill.ok { border-color: rgba(47, 212, 167, .45); }
+.pill.bad { border-color: rgba(255, 107, 107, .6); background: rgba(60, 16, 20, .45); }
+
+/* Read-only banner for every non-primary browser page.  Unlike the earlier
+ * full-screen overlay it never hides the page, so the phone list and status
+ * stay visible and the user can see that everything is actually connected. */
+.secondary-banner {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+  max-width: 1180px;
+  margin: 14px auto 0;
+  padding: 12px 16px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 170, 60, .55);
+  background: rgba(70, 44, 10, .55);
+  color: #ffdca8;
+  font-size: 13.5px;
+  line-height: 1.6;
+  position: relative; z-index: 10;
+}
+.secondary-banner.hidden { display: none; }
+.secondary-banner b { color: #ffb454; }
+.secondary-banner .secondary-actions { color: #ffdca8; font-weight: 600; }
+.secondary-banner .micro { color: #d7b98a; }
+
+/* A secondary page keeps everything visible but cannot change anything. */
+body.readonly-page main { opacity: .55; pointer-events: none; }
+body.readonly-page .topbar { opacity: .75; }
+body.readonly-page .player-card { pointer-events: none; }
+
 main {
   position: relative;
   z-index: 1;
@@ -235,6 +264,30 @@ h2 {
   color: var(--muted); font-size: 12.5px;
 }
 .slider-row b { text-align: right; font-variant-numeric: tabular-nums; color: var(--text); font-weight: 600; }
+
+/* ---- master playback card ---- */
+.player-card { border-color: rgba(96, 165, 250, .35); }
+.master-row {
+  display: flex; align-items: center; gap: 18px;
+  margin-top: 14px; flex-wrap: wrap;
+}
+.btn.big {
+  min-width: 132px; padding: 14px 20px; font-size: 14px; font-weight: 600;
+}
+.btn.big.paused { background: rgba(120, 130, 145, .28); color: var(--muted); }
+.btn.big.muted { background: rgba(245, 165, 36, .28); color: #ffd08a; }
+.master-vol { flex: 1 1 240px; min-width: 200px; }
+.master-vol-head {
+  display: flex; justify-content: space-between; align-items: baseline;
+  color: var(--muted); font-size: 13px; margin-bottom: 6px;
+}
+.master-vol-head b {
+  font-variant-numeric: tabular-nums; color: var(--text);
+  font-size: 17px; font-weight: 600;
+}
+.range-lg { height: 8px; }
+.range-lg::-webkit-slider-thumb { width: 22px; height: 22px; }
+.range-lg::-moz-range-thumb { width: 22px; height: 22px; }
 
 input[type="range"] { width: 100%; accent-color: var(--accent); }
 select, input[type="text"], input[type="password"] {

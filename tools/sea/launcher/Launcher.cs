@@ -74,12 +74,23 @@ internal static class Program
     private static void Main()
     {
         bool createdNew;
-        _mutex = new Mutex(true, @"Local\LANAudio.Launcher.v1", out createdNew);
+        // Global\ works across sessions. Wait a moment for a competing launch
+        // (Windows can fire two starts for one double-click).
+        _mutex = new Mutex(true, @"Global\LANAudio.Launcher.v3", out createdNew);
         if (!createdNew)
         {
-            // Another launcher already owns the app. Just show its page.
-            int port = FindRunningPort();
-            if (port > 0) OpenPage(port);
+            // Another instance owns the app. Wait for its backend, then just
+            // open the page and exit. Never spawn a second backend.
+            int port = WaitForRunningPort(25000);
+            if (port > 0)
+            {
+                OpenPage(port);
+            }
+            else
+            {
+                MessageBox.Show("LAN Audio 已在运行，但服务暂未就绪。\n请等待几秒后双击托盘图标打开页面。",
+                    AppTitle, MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
             return;
         }
 
@@ -94,43 +105,96 @@ internal static class Program
 
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
+        Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+        Application.ThreadException += (s, e) => LogStartup("UI exception: " + e.Exception);
 
+        // Reuse an already-serving backend (e.g. started from another folder).
         int running = FindRunningPort();
         if (running > 0)
         {
-            // Backend is already serving (maybe started from another folder).
-            // Attach to it instead of spawning a second copy.
-            OpenPage(running);
+            _port = running;
             ShowTray(attachOnly: true, port: running);
+            OpenPage(running);
             Application.Run();
             return;
         }
 
-        try
+        if (!StartBackend(exe))
         {
-            var psi = new ProcessStartInfo(exe)
-            {
-                WorkingDirectory = _baseDir,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                WindowStyle = ProcessWindowStyle.Hidden,
-                RedirectStandardOutput = false,
-                RedirectStandardError = false,
-            };
-            _server = Process.Start(psi);
-            if (_server == null) throw new InvalidOperationException("start failed");
-        }
-        catch (Exception ex)
-        {
-            MessageBox.Show("无法启动服务：" + ex.Message, AppTitle,
-                MessageBoxButtons.OK, MessageBoxIcon.Error);
+            // Backend could not start: clean up so the next double-click retries.
+            ReleaseMutex();
             return;
         }
 
-        int ready = WaitForServer(15000);
-        ShowTray(attachOnly: false, port: ready > 0 ? ready : BasePort);
-        OpenPage(ready > 0 ? ready : BasePort);
+        int ready = WaitForServer(25000);
+        if (ready <= 0)
+        {
+            LogStartup("backend did not answer in time");
+            MessageBox.Show("服务启动超时。请检查防火墙是否允许 lan-audio-backend-2026.exe 访问网络，\n" +
+                "或稍后再次双击启动。", AppTitle, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            KillBackend();
+            ReleaseMutex();
+            return;
+        }
+
+        _port = ready;
+        ShowTray(attachOnly: false, port: ready);
+        OpenPage(ready);
         Application.Run();
+    }
+
+    /** Start the backend, retrying once; returns true only if a process runs. */
+    private static bool StartBackend(string exe)
+    {
+        for (int attempt = 0; attempt < 2; attempt++)
+        {
+            try
+            {
+                var psi = new ProcessStartInfo(exe)
+                {
+                    WorkingDirectory = _baseDir,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                };
+                var proc = Process.Start(psi);
+                if (proc == null) throw new InvalidOperationException("Process.Start returned null");
+
+                // Give it a moment; a SEA exe that fails immediately exits fast.
+                if (proc.WaitForExit(1500))
+                {
+                    LogStartup("backend exited immediately, code " + proc.ExitCode + " (attempt " + (attempt + 1) + ")");
+                    continue;
+                }
+                _server = proc;
+                LogStartup("backend started pid " + proc.Id);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                LogStartup("backend start failed: " + ex.Message + " (attempt " + (attempt + 1) + ")");
+                Thread.Sleep(400);
+            }
+        }
+        return false;
+    }
+
+    private static void KillBackend()
+    {
+        try
+        {
+            if (_server != null && !_server.HasExited)
+            {
+                _server.Kill();
+                _server.WaitForExit(3000);
+            }
+        }
+        catch { /* ignore */ }
+        _server = null;
+    }
+
+    private static void ReleaseMutex()
+    {
+        try { if (_mutex != null) _mutex.ReleaseMutex(); } catch { /* ignore */ }
     }
 
     private static int FindRunningPort()
@@ -142,13 +206,40 @@ internal static class Program
         return 0;
     }
 
+    /** Poll until the first instance has its backend listening. */
+    private static int WaitForRunningPort(int timeoutMs)
+    {
+        var sw = Stopwatch.StartNew();
+        int delay = 100;
+        while (sw.ElapsedMilliseconds < timeoutMs)
+        {
+            int port = FindRunningPort();
+            if (port > 0) return port;
+            Thread.Sleep(delay);
+            if (delay < 500) delay += 50;
+        }
+        return 0;
+    }
+
     private static bool IsRunning(int port)
     {
         try
         {
+            // Probe the socket first: a closed port fails instantly, so only
+            // the few ports that are actually listening pay the HTTP cost.
+            using (var client = new System.Net.Sockets.TcpClient())
+            {
+                var ar = client.BeginConnect("127.0.0.1", port, null, null);
+                if (!ar.AsyncWaitHandle.WaitOne(250)) return false;
+                client.EndConnect(ar);
+            }
+
             var req = (HttpWebRequest)WebRequest.Create("http://127.0.0.1:" + port + "/api/info");
-            req.Timeout = 120;
+            req.Timeout = 1500;
+            req.ReadWriteTimeout = 1500;
             req.Proxy = null;
+            req.KeepAlive = false;
+            req.ServicePoint.Expect100Continue = false;
             using (var resp = (HttpWebResponse)req.GetResponse())
             using (var sr = new StreamReader(resp.GetResponseStream()))
             {
@@ -167,9 +258,13 @@ internal static class Program
         var sw = Stopwatch.StartNew();
         while (sw.ElapsedMilliseconds < timeoutMs)
         {
-            int port = FindRunningPort();
-            if (port > 0) return port;
-            Thread.Sleep(200);
+            // The backend binds BasePort first and only walks upwards when it is
+            // taken, so check a short range instead of all 30 ports each pass.
+            for (int port = BasePort; port < BasePort + 4; port++)
+            {
+                if (IsRunning(port)) return port;
+            }
+            Thread.Sleep(150);
             if (_server != null && _server.HasExited) break;
         }
         return 0;
@@ -219,11 +314,35 @@ internal static class Program
         _watch = new System.Windows.Forms.Timer { Interval = 2000 };
         _watch.Tick += (s, e) =>
         {
-            bool alive = _server != null && !_server.HasExited;
-            if (!alive && !attachOnly) Quit();
-            else if (!alive && attachOnly && FindRunningPort() == 0) Quit();
+            // Only treat "backend gone" as fatal when this launcher started it.
+            // An attached launcher must not kill itself on a transient miss.
+            if (attachOnly) return;
+            bool gone = _server != null && _server.HasExited;
+            if (!gone) return;
+
+            // The backend may have been restarted by hand; re-check the port
+            // before deciding to quit.
+            if (FindRunningPort() > 0)
+            {
+                _server = null;
+                return;
+            }
+            LogStartup("backend exited unexpectedly, quitting launcher");
+            Quit();
         };
         _watch.Start();
+    }
+
+    private static void LogStartup(string message)
+    {
+        try
+        {
+            string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "LAN Audio");
+            Directory.CreateDirectory(dir);
+            File.AppendAllText(Path.Combine(dir, "launcher.log"),
+                DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " [start] " + message + Environment.NewLine);
+        }
+        catch { /* ignore */ }
     }
 
     /* ---------- global hotkeys (server-side config, native registration) ---------- */

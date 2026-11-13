@@ -232,6 +232,56 @@ class MicDsp {
     }
 }
 
+/** Anti-aliasing decimator for the microphone stream.
+ *
+ *  Capture stays at 48 kHz but the microphone is often sent at 24 or 16 kHz.
+ *  Plain block averaging is a weak low-pass, so out-of-band hiss folded back
+ *  into the speech band; this applies a short windowed-sinc FIR before taking
+ *  every N-th sample.  It runs after [MicDsp] and does not alter its tuning.
+ */
+internal class MicDecimator {
+    private val taps = DoubleArray(TAPS) { i ->
+        val m = i - (TAPS - 1) / 2.0
+        val sinc = if (m == 0.0) 1.0 else sin(PI * 0.42 * m) / (PI * 0.42 * m)
+        val w = 0.42 - 0.5 * cos(2.0 * PI * i / (TAPS - 1)) + 0.08 * cos(4.0 * PI * i / (TAPS - 1))
+        sinc * w
+    }
+    private val history = DoubleArray(TAPS)
+    private var pos = 0
+    private var primed = false
+
+    fun process(input: DoubleArray): DoubleArray {
+        val out = DoubleArray(input.size)
+        if (!primed) {
+            java.util.Arrays.fill(history, input[0])
+            primed = true
+        }
+        for (i in input.indices) {
+            history[pos] = input[i]
+            pos = (pos + 1) % TAPS
+            var acc = 0.0
+            var idx = pos
+            for (k in 0 until TAPS) {
+                acc += history[idx] * taps[k]
+                idx++
+                if (idx == TAPS) idx = 0
+            }
+            out[i] = acc
+        }
+        return out
+    }
+
+    fun reset() {
+        primed = false
+        pos = 0
+        java.util.Arrays.fill(history, 0.0)
+    }
+
+    companion object {
+        private const val TAPS = 31
+    }
+}
+
 /** Simple RBJ biquad, used for the microphone high-pass. */
 private class Biquad(
     private val b0: Double,

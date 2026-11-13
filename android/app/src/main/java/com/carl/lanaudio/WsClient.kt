@@ -60,7 +60,7 @@ class WsClient(
     @Volatile
     private var reconnectScheduled = false
 
-    private val sendQueue = ArrayBlockingQueue<ByteArray>(30)
+    private val sendQueue = ArrayBlockingQueue<ByteArray>(60)
     private var senderThread: Thread? = null
 
     fun connect() {
@@ -182,9 +182,11 @@ class WsClient(
         buffer.put(0)
         for (s in samples) buffer.putShort(s)
 
-        if (!sendQueue.offer(buffer.array())) {
-            sendQueue.poll()
-            sendQueue.offer(buffer.array())
+        val bytes = buffer.array()
+        if (!sendQueue.offer(bytes)) {
+            // Queue full (network stalled).  Dropping the NEWEST frame keeps the
+            // already-queued audio contiguous; dropping the oldest punched a
+            // hole in the timeline, which was audible as a click/burst.
             clientDrops++
             if (clientDrops == 1 || clientDrops % 100 == 0) onEvent("发送队列丢帧 $clientDrops")
         }

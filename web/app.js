@@ -31,6 +31,7 @@ let sendNode = null;
 let playerNode = null;
 let playGain = null;
 let monitorNode = null;
+let monitorGainNode = null;
 let audioReady = false;
 let audioStarting = null;
 
@@ -179,7 +180,7 @@ function syncControls() {
   $('bufferMsVal').textContent = settings.bufferMs + ' ms';
   $('playVolume').value = String(Math.round(settings.playVolume * 100));
   $('playVolumeVal').textContent = Math.round(settings.playVolume * 100) + '%';
-  $('playToggle').checked = !!settings.playEnabled;
+  updatePlayToggleButton();
   $('monitorVolume').value = String(Math.round((settings.monitorVolume == null ? 0.7 : settings.monitorVolume) * 100));
   $('monitorVolumeVal').textContent = Math.round((settings.monitorVolume == null ? 0.7 : settings.monitorVolume) * 100) + '%';
   $('monitorNr').value = String(Math.round(settings.monitorNr == null ? 40 : settings.monitorNr));
@@ -236,13 +237,19 @@ function bindControls() {
     settings.playVolume = Number(e.target.value) / 100;
     $('playVolumeVal').textContent = e.target.value + '%';
     saveSettings();
+    // Dragging the volume is a user gesture: start the engine if needed so
+    // the slider responds immediately.
+    if (!playerNode) enableAudio().catch(() => {});
     updatePlaybackGain();
   });
 
-  $('playToggle').addEventListener('change', (e) => {
-    settings.playEnabled = e.target.checked;
+  // Master play/pause button replaces the old checkbox.
+  $('btnPlayToggle').addEventListener('click', () => {
+    settings.playEnabled = !settings.playEnabled;
     saveSettings();
+    updatePlayToggleButton();
     updatePlaybackGain();
+    log(settings.playEnabled ? '已恢复播放手机声音' : '已暂停播放手机声音', settings.playEnabled ? '' : 'warn');
   });
 
   $('monitorVolume').addEventListener('input', (e) => {
@@ -317,7 +324,6 @@ function bindControls() {
   $('btnMonitor').addEventListener('click', () => toggleMonitor());
   $('btnSystem').addEventListener('click', () => toggleDisplay());
   $('btnStopSend').addEventListener('click', () => stopAllSources());
-  $('btnEnableAudio').addEventListener('click', () => enableAudio(true));
 }
 
 /* ---------------- audio graph ---------------- */
@@ -332,7 +338,7 @@ async function enableAudio(fromButton = false) {
   audioStarting = (async () => {
     try {
       ctx = new AudioContext({ sampleRate: 48000, latencyHint: 'interactive' });
-      await ctx.audioWorklet.addModule('/pcm-worklet.js?v=12');
+      await ctx.audioWorklet.addModule('/pcm-worklet.js?v=16');
 
       mixBus = ctx.createGain();
       mixBus.channelCount = 2;
@@ -369,21 +375,25 @@ async function enableAudio(fromButton = false) {
       playGain.gain.value = 0;
       playerNode.connect(playGain).connect(ctx.destination);
 
-      // Local monitor chain: source gain -> NR/gate + soft limiter -> speakers.
+      // Local monitor chain: source gain (unity) -> NR/gate + soft limiter
+      // -> monitor gain -> speakers.  The volume gain sits AFTER the worklet
+      // so the gate thresholds always see the unscaled microphone signal.
+      monitorGainNode = ctx.createGain();
+      monitorGainNode.gain.value = settings.monitorMuted ? 0 : settings.monitorVolume;
+
       monitorNode = new AudioWorkletNode(ctx, 'pcm-monitor', {
         numberOfInputs: 1,
         numberOfOutputs: 1,
         outputChannelCount: [2],
       });
       monitorNode.port.postMessage({ type: 'config', nr: settings.monitorNr });
-      monitorNode.connect(ctx.destination);
+      monitorNode.connect(monitorGainNode).connect(ctx.destination);
 
       audioReady = true;
       await ctx.resume();
       updatePlaybackGain();
+      if (pageRole === 'secondary') silenceForSecondary();
       log(`音频引擎已启动（${ctx.sampleRate} Hz）`, 'ok');
-      $('btnEnableAudio').disabled = true;
-      $('btnEnableAudio').textContent = '音频已启用';
     } catch (err) {
       log('音频引擎启动失败：' + (err && err.message ? err.message : err), 'err');
       audioStarting = null;
@@ -404,7 +414,8 @@ function applySourceRouting(item) {
   try { item.monitorGain.disconnect(); } catch { /* ignore */ }
   if (item.send && mixBus) item.sendGain.connect(mixBus);
   if (item.monitor) {
-    item.monitorGain.gain.value = settings.monitorMuted ? 0 : settings.monitorVolume;
+    // Unity into the monitor worklet; loudness/mute is applied after it.
+    item.monitorGain.gain.value = 1;
     item.monitorGain.connect(monitorNode || ctx.destination);
   }
 }
@@ -416,7 +427,7 @@ async function addSource(key, stream, options = {}) {
   const sendGain = ctx.createGain();
   const monitorGain = ctx.createGain();
   sendGain.gain.value = 1;
-  monitorGain.gain.value = settings.monitorMuted ? 0 : settings.monitorVolume;
+  monitorGain.gain.value = 1;
   src.connect(sendGain);
   src.connect(monitorGain);
 
@@ -511,9 +522,12 @@ function refreshSourceUI() {
 }
 
 function updateMonitorGain() {
-  const gain = settings.monitorMuted ? 0 : settings.monitorVolume;
-  for (const item of sources.values()) {
-    try { item.monitorGain.gain.value = gain; } catch { /* ignore */ }
+  if (monitorGainNode) {
+    const gain = settings.monitorMuted ? 0 : settings.monitorVolume;
+    monitorGainNode.gain.value = gain;
+    if (monitorNode) {
+      try { monitorNode.port.postMessage({ type: 'enable', on: gain > 0 }); } catch { /* ignore */ }
+    }
   }
   const el = $('monitorVolumeVal');
   if (el) el.textContent = Math.round(settings.monitorVolume * 100) + '%';
@@ -527,14 +541,96 @@ function updateMonitorNr() {
   if (el) el.textContent = Math.round(settings.monitorNr) + '%';
 }
 
+/* ---------------- page exclusivity ---------------- */
+
+// Only one browser page may play audio.  The server marks the first page as
+// primary; any later page is told to stop and shows an overlay instead.
+// 'primary' | 'secondary' | 'unknown'.  Until the server says otherwise the
+// page is allowed to play, so a single page always works immediately.
+let wasPrimary = false;
+let pageRole = 'unknown';
+
+function applyPageStatus(count, isPrimary) {
+  window.__pcPages = count;
+  const pill = $('pagePill');
+  const text = $('pageText');
+  const dot = $('pageDot');
+  if (pill) {
+    pill.classList.toggle('bad', count > 1);
+    pill.classList.toggle('ok', count === 1);
+  }
+  if (text) text.textContent = `前端 ${count}`;
+  if (dot) setDot(dot, count === 1 ? 'ok' : 'bad');
+
+  const overlay = $('secondaryBanner');
+
+  if (!isPrimary) {
+    const becameSecondary = pageRole !== 'secondary';
+    pageRole = 'secondary';
+    wasPrimary = false;
+    silenceForSecondary();
+    if (overlay) {
+      overlay.classList.remove('hidden');
+      const msg = $('secondaryCount');
+      if (msg) msg.textContent = `当前共有 ${count} 个前端连接。`;
+    }
+    document.body.classList.add('readonly-page');
+    if (becameSecondary) log('本页面只读：已有另一个前端在控制声音', 'warn');
+    return;
+  }
+
+  const becamePrimary = pageRole !== 'primary';
+  pageRole = 'primary';
+  wasPrimary = true;
+  if (overlay) overlay.classList.add('hidden');
+  document.body.classList.remove('readonly-page');
+  if (becamePrimary) {
+    // New page, or taking over after the previous primary closed.
+    updatePlaybackGain();
+  }
+}
+
+/** Mute the local mixer so a secondary page is completely silent. */
+function silenceForSecondary() {
+  try {
+    if (playGain) playGain.gain.value = 0;
+    if (monitorGainNode) monitorGainNode.gain.value = 0;
+    if (playerNode) playerNode.port.postMessage({ type: 'flush' });
+    if (ctx && ctx.state === 'running') {
+      for (const item of sources.values()) {
+        try { item.send = false; applySourceRouting(item); } catch { /* ignore */ }
+      }
+    }
+  } catch { /* ignore */ }
+}
+
 function updatePlaybackGain() {
   if (!playGain) return;
+  // Only silence when the server explicitly marked this page secondary.
+  if (pageRole === 'secondary') return;
   const sysLoop = sources.has('display') && lastDisplaySurface !== 'browser';
   const autoMute = settings.duplex === 'auto' && sysLoop;
   let g = settings.playEnabled ? settings.playVolume : 0;
   if (autoMute) g = 0;
   playGain.gain.value = g;
   $('duplexWarn').classList.toggle('hidden', !autoMute);
+  updatePlayToggleButton();
+}
+
+/** Master play/pause button reflecting playback state. */
+function updatePlayToggleButton() {
+  const btn = $('btnPlayToggle');
+  if (!btn) return;
+  const on = settings.playEnabled && settings.playVolume > 0;
+  btn.textContent = settings.playEnabled ? (settings.playVolume > 0 ? '正在播放' : '已静音') : '已暂停';
+  btn.classList.toggle('paused', !on);
+  btn.classList.toggle('muted', settings.playEnabled && settings.playVolume <= 0);
+  const state = $('audioEngineState');
+  if (state) {
+    state.textContent = !audioReady
+      ? '音频引擎未启动（拖动音量会自动启动）'
+      : `音频引擎运行中 · ${ctx ? ctx.sampleRate / 1000 : 48} kHz`;
+  }
 }
 
 /* ---------------- capture ---------------- */
@@ -741,6 +837,7 @@ function clamp16(v) {
 
 function onBinary(data) {
   if (data.byteLength < 6) return;
+  if (window.__audioFrameCount != null) window.__audioFrameCount++;
   const all = new Uint8Array(data);
   const id = String(all[0]);
   const f = all;
@@ -784,10 +881,36 @@ function onBinary(data) {
   // main gain only; the worklet applies the microphone-only gain itself
   const gain = item && !item.mute ? item.volume : 0;
   const streamId = isMic ? id + '#mic' : id;
-  // Copy into an owned buffer so the mixer gets a clean, transferable message.
-  const body = f.buffer.slice(f.byteOffset + 1, f.byteOffset + f.byteLength);
-  const pcm = new Int16Array(body, pcmOffset - 1, Math.floor((body.byteLength - (pcmOffset - 1)) / 2));
-  playerNode.port.postMessage({ id: streamId, pcm, rate, channels, gain }, [body]);
+
+  // Frame layout (see WsClient.sendAudio): [0]=source [1]=frameType
+  // [2]=rate [3]=channels [4]=reserved, then little-endian int16 samples.
+  // Build a view directly on the received buffer.  The old code used a
+  // transfer list, which failed silently in some browsers and left the mixer
+  // with no samples at all.
+  if (f.byteLength < pcmOffset + 2) return;
+
+  let pcm;
+  try {
+    const start = f.byteOffset + pcmOffset;
+    const bytes = (f.byteLength - pcmOffset) & ~1;
+    if (start % 2 === 0) {
+      pcm = new Int16Array(f.buffer, start, bytes >> 1);
+    } else {
+      const copy = f.slice(pcmOffset, pcmOffset + bytes);
+      pcm = new Int16Array(copy.buffer, copy.byteOffset, bytes >> 1);
+    }
+  } catch (err) {
+    if (window.__audioDebug) console.warn('pcm view failed', err);
+    return;
+  }
+
+  try {
+    // No transfer list: plain structured clone works everywhere.
+    playerNode.port.postMessage({ id: streamId, pcm, rate, channels, gain });
+    if (window.__audioPosted != null) window.__audioPosted++;
+  } catch (err) {
+    if (window.__audioDebug) console.warn('postMessage failed', err);
+  }
 }
 
 function sendPhoneControl(p, action, extra = {}) {
@@ -803,8 +926,12 @@ function sendPhoneControl(p, action, extra = {}) {
 }
 
 function setPhoneGain(p) {
-  if (!playerNode || !p) return;
+  if (!p) return;
   const g = p.mute ? 0 : (p.volume == null ? 1 : p.volume);
+  // Save first: the slider must work even before the audio engine is enabled,
+  // otherwise the value is silently thrown away and nothing happens later.
+  saveDevice(p);
+  if (!playerNode) return;
   playerNode.port.postMessage({
     type: 'set-phone',
     id: p.id,
@@ -815,7 +942,6 @@ function setPhoneGain(p) {
     bufferMs: p.bufferMs == null ? settings.bufferMs : p.bufferMs,
     catchup: p.catchup == null ? settings.catchup : p.catchup,
   });
-  saveDevice(p);
 }
 
 /** Global buffer slider: applies the same target to every connected phone. */
@@ -1043,6 +1169,12 @@ function handleText(raw) {
   try { msg = JSON.parse(raw); } catch { return; }
 
   if (msg.type === 'welcome') {
+    applyPageStatus(1, msg.primary !== false);
+    fetch('/api/info').then((r) => r.json()).then((info) => {
+      if (info && typeof info.pcPages === 'number') {
+        applyPageStatus(info.pcPages, info.pcPages <= 1);
+      }
+    }).catch(() => {});
     if (msg.room) {
       room = msg.room;
       $('roomCode').textContent = room;
@@ -1055,7 +1187,6 @@ function handleText(raw) {
     }
     if (typeof msg.pcMuted === 'boolean') {
       settings.playEnabled = !msg.pcMuted;
-      $('playToggle').checked = settings.playEnabled;
       updatePlaybackGain();
     }
     $('peerText').textContent = phones.size ? `手机 ${phones.size} 台` : '手机未连接';
@@ -1081,9 +1212,12 @@ function handleText(raw) {
     updatePhoneSlots();
     return;
   }
+  if (msg.type === 'pc-pages') {
+    applyPageStatus(msg.count || 1, msg.primary !== false);
+    return;
+  }
   if (msg.type === 'pc-mute') {
     settings.playEnabled = !msg.muted;
-    $('playToggle').checked = settings.playEnabled;
     saveSettings();
     updatePlaybackGain();
     log(msg.muted ? '电脑端已静音' : '电脑端已取消静音', 'warn');
@@ -1385,6 +1519,11 @@ function buildPhoneRow(p) {
   p.els.vol.addEventListener('input', () => {
     p.volume = Number(p.els.vol.value) / 100;
     setPhoneGain(p);
+    if (!playerNode) {
+      // The slider is a playback control: enable the output automatically
+      // instead of silently doing nothing.
+      enableAudio().catch(() => {});
+    }
   });
   p.els.micGain.addEventListener('input', () => {
     p.micGain = Number(p.els.micGain.value) / 100;

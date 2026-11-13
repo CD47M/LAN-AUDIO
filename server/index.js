@@ -228,6 +228,7 @@ const server = http.createServer((req, res) => {
   } catch { /* fall through to static handler */ }
 
   if (pathname === '/api/info' || req.url.startsWith('/api/info')) {
+    const mainRoom = rooms.get(ROOM);
     return sendJson(res, 200, {
       service: 'lanaudio',
       room: ROOM,
@@ -235,6 +236,11 @@ const server = http.createServer((req, res) => {
       udpPort: UDP_PORT,
       addresses: localIPv4().map((x) => x.address),
       version: 2,
+      // Number of browser pages currently attached.  More than one means
+      // several tabs play the same audio at once, which makes volume feel
+      // broken: each page mixes independently.
+      pcPages: mainRoom ? mainRoom.pcs.size : 0,
+      phones: mainRoom ? mainRoom.phones.size : 0,
     });
   }
 
@@ -348,6 +354,21 @@ function notifyPc(room, payload) {
 
 function notifyPhone(room, id, payload) {
   sendText(room.phones.get(id), payload);
+}
+
+/** Tell every attached PC page how many pages exist and who is primary. */
+function announcePcPages(room) {
+  const list = [...room.pcs];
+  const primary = list.find((p) => p.isPrimary) || null;
+  const count = list.length;
+  for (const pc of list) {
+    sendText(pc, {
+      type: 'pc-pages',
+      count,
+      primary: pc === primary,
+      primarySince: primary && primary.joinedAt ? primary.joinedAt : null,
+    });
+  }
 }
 
 function broadcastPhones(room, payload) {
@@ -506,12 +527,20 @@ wss.on('connection', (ws, req) => {
   ws.on('pong', () => { ws.isAlive = true; });
 
   if (role === 'pc') {
+    // Only one PC page may drive the audio.  A second page cannot stream or
+    // mix anything; it is told to close itself instead of silently doubling
+    // the sound and confusing every volume slider.
+    const isPrimary = room.pcs.size === 0;
     room.pcs.add(ws);
     ws.clientId = 'pc';
+    ws.isPrimary = isPrimary;
+    ws.joinedAt = Date.now();
+
     sendText(ws, {
       type: 'welcome',
       role,
       room: code,
+      primary: isPrimary,
       peer: phoneList(room).length > 0,
       phones: phoneList(room),
       udpPort: UDP_PORT,
@@ -519,11 +548,22 @@ wss.on('connection', (ws, req) => {
       pcMuted: room.pcMuted === true,
       hotkeys,
     });
-    broadcastPhones(room, { type: 'peer', connected: true, role });
-    console.log(`[ws] pc joined room ${code}`);
+
+    announcePcPages(room);
+
+    if (!isPrimary) {
+      console.log(`[ws] pc joined room ${code} as SECONDARY (rejected for audio)`);
+      // Read-only page: it still receives state JSON so it can show the
+      // warning, but binary audio is refused below.
+    } else {
+      console.log(`[ws] pc joined room ${code} as PRIMARY`);
+      broadcastPhones(room, { type: 'peer', connected: true, role });
+    }
 
     ws.on('message', (data, isBinary) => {
       if (isBinary) {
+        // Secondary pages never contribute audio to the phones.
+        if (!ws.isPrimary) return;
         // Phones always receive a 1-byte source id (0 = PC) before the frame,
         // so the phone side never has to guess the framing.
         const out = Buffer.concat([Buffer.from([0]), data]);
@@ -576,9 +616,18 @@ wss.on('connection', (ws, req) => {
 
     ws.on('close', () => {
       if (!room.pcs.delete(ws)) return;
-      if (room.pcs.size === 0) {
-        broadcastPhones(room, { type: 'peer', connected: false, role });
+      // If the primary page closed, the earliest remaining page takes over so
+      // the user is never left without a working controller.
+      if (ws.isPrimary) {
+        const next = [...room.pcs].sort((a, b) => (a.joinedAt || 0) - (b.joinedAt || 0))[0];
+        if (next) {
+          next.isPrimary = true;
+          console.log(`[ws] pc primary promoted (room ${code})`);
+        }
+        if (room.pcs.size > 0) broadcastPhones(room, { type: 'peer', connected: true, role });
+        else broadcastPhones(room, { type: 'peer', connected: false, role });
       }
+      announcePcPages(room);
       if (room.pcs.size === 0 && room.phones.size === 0) rooms.delete(code);
       console.log(`[ws] pc left room ${code} (${room.pcs.size} left)`);
     });
@@ -625,8 +674,12 @@ wss.on('connection', (ws, req) => {
       const body = data.subarray(1);
       if (target === 0) {
         const out = Buffer.concat([Buffer.from([Number(id)]), body]);
+        // Only the primary page receives phone audio.  A secondary page would
+        // otherwise play the same stream a second time out of the same
+        // speakers, which made every volume slider look broken.
         for (const pc of room.pcs) {
           if (!isOpen(pc)) continue;
+          if (!pc.isPrimary) continue;
           if (pc.bufferedAmount > 8 * 1024 * 1024) continue;
           try { pc.send(out, { binary: true }); } catch { /* ignore */ }
         }

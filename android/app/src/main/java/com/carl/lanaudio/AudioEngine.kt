@@ -61,6 +61,7 @@ class AudioEngine(
     private var emitThread: Thread? = null
     private val effects = mutableListOf<AudioEffect>()
     private val micDsp = MicDsp()
+    private val micDecimator = MicDecimator()
     private var appSilentFrames = 0
     @Volatile
     var captureDrops: Int = 0
@@ -353,15 +354,23 @@ class AudioEngine(
             24000 -> 2
             else -> 1
         }
+
+        if (ratio == 1) {
+            try {
+                onFrame(processed, micTargetRate, 1, FRAME_MIC)
+            } catch (_: Exception) {
+            }
+            return
+        }
+
+        // Decimate with a proper low-pass first.  Simple block averaging let
+        // high-frequency microphone noise alias back into the audible band,
+        // which is heard as a constant hiss on the PC.
         val outFrames = FRAME / ratio
         val out = ShortArray(outFrames)
-
+        val filtered = micDecimator.process(DoubleArray(processed.size) { processed[it].toDouble() })
         for (i in 0 until outFrames) {
-            var s = 0f
-            for (k in 0 until ratio) {
-                s += processed[i * ratio + k] / 32768f
-            }
-            out[i] = clamp(s / ratio)
+            out[i] = clampD(filtered[i * ratio])
         }
 
         try {
@@ -369,6 +378,12 @@ class AudioEngine(
         } catch (_: Exception) {
             // never let a dropped frame kill the stream
         }
+    }
+
+    private fun clampD(v: Double): Short = when {
+        v >= 32767.0 -> 32767
+        v <= -32768.0 -> -32768
+        else -> v.toInt().toShort()
     }
 
     private fun clamp(v: Float): Short = when {

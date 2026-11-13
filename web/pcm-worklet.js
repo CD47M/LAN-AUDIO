@@ -1,16 +1,14 @@
 /* AudioWorklets for LAN Audio
- * pcm-sender : captures mixed input at 48 kHz and posts 20 ms stereo blocks
- * pcm-mixer  : resamples every phone stream, keeps one jitter buffer per phone
- *              and sums them into a single stereo output.
  *
- * Streams are keyed by "<phoneId>" (app / system sound) or "<phoneId>#mic"
- * (microphone only).  App 1.2+ sends those as separate frames so the PC can
- * apply a microphone-only gain and place a mic in the left/right channel.
+ * pcm-sender  : captures mixed input at 48 kHz and posts 20 ms stereo blocks
+ * pcm-mixer   : resamples every phone stream, keeps one jitter buffer per phone
+ *               and sums them into a single stereo output
+ * pcm-monitor : local PC microphone monitoring with optional noise gate
  *
- * Each phone has its own receive-buffer target (20..400 ms).  When the
- * “balance buffer” switch is on, all active phones share the largest target;
- * otherwise each phone uses its own.  Underrun margin is capped, so the real
- * buffer can never run away to absurd values.
+ * This file deliberately keeps the mixer simple.  An earlier version added a
+ * per-phone downward expander and a soft limiter inside the mixer; both
+ * modulated the waveform on every sample and were audible as a low hum.
+ * Volume is now plain linear gain, exactly like the original working build.
  */
 
 class PcmSender extends AudioWorkletProcessor {
@@ -50,14 +48,15 @@ class PcmSender extends AudioWorkletProcessor {
   }
 }
 
-function softClip(x) {
-  const a = Math.abs(x);
-  if (a <= 0.8) return x;
-  return Math.sign(x) * (0.8 + 0.2 * Math.tanh((a - 0.8) / 0.2));
+/* Linear limiter used only to stop hard digital clipping when several phones
+ * are summed.  Unlike the old soft-knee curve it is transparent below 1.0,
+ * so a single phone at normal volume is never altered. */
+function hardClip(x) {
+  return x > 1 ? 1 : (x < -1 ? -1 : x);
 }
 
-/** PC-side microphone conditioning: gentle high-pass + adaptive downward
- *  expander.  It only ever runs on "#mic" streams, never on app audio. */
+/* Microphone noise reduction for phone mic streams.
+ * Gated by strength 0..100; only ever applied to "#mic" streams. */
 class MicNoiseFilter {
   constructor() {
     this.strength = 0;
@@ -95,10 +94,10 @@ class MicNoiseFilter {
 
     const threshold = Math.max(0.0015, this.floor * 3.5) + level * 0.0015;
     const open = this.env > threshold;
-    // Low strength barely gates; 100 only attenuates by about 20 dB.
-    const closed = 1 - level * 0.9;
+    // Shallow closure only: deep gating on a continuous stream reads as hum.
+    const closed = 1 - level * 0.6;
     const target = open ? 1 : closed;
-    this.gate += (target - this.gate) * (open ? 0.08 : 0.0025);
+    this.gate += (target - this.gate) * (open ? 0.08 : 0.02);
     return [this.hpY * this.gate, this.hpY2 * this.gate];
   }
 }
@@ -113,7 +112,6 @@ class PhoneStream {
     this.count = 0;
     this.readFrac = 0;
     this.step = 1;
-    this.catchup = 25;     // 0..100 -> 1.005x .. 1.15x
     this.playing = false;
     this.lastUnderrunBlock = 0;
     this.underruns = 0;
@@ -125,29 +123,36 @@ class PhoneStream {
     this.gain = 1;
     this.mainGain = 1;
     this.micGain = 1;
+    this.hasCfgGain = false;   // explicit slider value wins over frame gain
     this.mic = false;
     this.phoneId = 'default';
     this.pan = 0;
     this.panL = 1;
     this.panR = 1;
-    // target buffer, in samples
-    this.baseTarget = 0;   // configured by the user
-    this.extra = 0;        // temporary underrun safety margin
+    this.baseTarget = 0;
+    this.extra = 0;
     this.targetSamples = 0;
-    this.effTarget = 0;    // last effective target, used to detect changes
+    this.effTarget = 0;
     this.idleFrames = 0;
     this.dead = false;
     this.lastPushBlock = 0;
     this.pushed = 0;
-    // Declick state used only for the 750 ms emergency cut.
-    this.declickLeft = 0;
-    this.declickTotal = 0;
     this.lastOutL = 0;
     this.lastOutR = 0;
+    this.holdL = 0;
+    this.holdR = 0;
+    this.shortUnderruns = 0;
     this.nr = 0;
     this.nrFilter = new MicNoiseFilter();
+    this.nrActive = false;
     this.fadeLeft = 0;
     this.fadeTotal = 0;
+    this.started = false;
+    this.lastReceiveBlock = 0;
+    // Block-level expander state for the per-phone boost.
+    this.env = 0;
+    this.peakRef = 0;
+    this.boostEnv = 1;
   }
 }
 
@@ -157,12 +162,12 @@ class PcmMixer extends AudioWorkletProcessor {
     this.streams = new Map();
     this.phoneCfg = new Map();
     this.defaultTarget = Math.round(sampleRate * 0.09);
-    // User range is 20..400 ms; underrun margin adds at most 120 ms.
     this.maxTargetSamples = Math.round(sampleRate * 0.55);
-    // Hard trim: whatever happens, never keep more than 750 ms of audio.
     this.maxBufferSamples = Math.round(sampleRate * 0.75);
     this.maxExtra = Math.round(sampleRate * 0.08);
     this.extraStep = Math.round(sampleRate * 0.02);
+    // ~25 blocks (about 66 ms) of sustained starvation before a real rebuffer.
+    this.maxShortUnderruns = 25;
     this.balance = true;
     this.blocks = 0;
     this.lastReport = 0;
@@ -174,7 +179,6 @@ class PcmMixer extends AudioWorkletProcessor {
 
       if (msg.type === 'config' && Number.isFinite(msg.bufferMs)) {
         this.defaultTarget = this.msToSamples(msg.bufferMs);
-        // Streams without an explicit per-phone target follow the global one.
         for (const s of this.streams.values()) {
           const cfg = this.phoneCfg.get(s.phoneId) || {};
           if (!Number.isFinite(cfg.bufferMs)) s.baseTarget = this.defaultTarget;
@@ -192,10 +196,11 @@ class PcmMixer extends AudioWorkletProcessor {
         return;
       }
       if (msg.type === 'set-gain' && msg.id != null) {
-        // Legacy path (no separate mic stream): treat as the main gain.
+        // Legacy path: treat as the main gain.
         const s = this.streams.get(String(msg.id));
         if (s) {
           s.mainGain = Number.isFinite(msg.gain) ? Math.max(0, Math.min(3, msg.gain)) : 1;
+          s.hasCfgGain = true;
           this.applyStreamConfig(s);
         }
         return;
@@ -236,7 +241,9 @@ class PcmMixer extends AudioWorkletProcessor {
 
   applyStreamConfig(s) {
     const cfg = this.phoneCfg.get(s.phoneId) || {};
-    const main = Number.isFinite(cfg.gain) ? cfg.gain : s.mainGain;
+    const hasGain = Number.isFinite(cfg.gain);
+    if (hasGain) s.hasCfgGain = true;
+    const main = hasGain ? cfg.gain : s.mainGain;
     const micGain = Number.isFinite(cfg.micGain) ? cfg.micGain : s.micGain;
     const pan = Number.isFinite(cfg.pan) ? cfg.pan : s.pan;
 
@@ -246,8 +253,12 @@ class PcmMixer extends AudioWorkletProcessor {
     s.pan = pan;
     s.nr = s.mic && Number.isFinite(cfg.nr) ? cfg.nr : 0;
     s.nrFilter.setStrength(s.nr);
+    const nrActive = s.nr > 0;
+    if (s.nrActive !== nrActive) {
+      s.nrActive = nrActive;
+      s.nrFilter.reset();
+    }
     const p = s.mic ? pan : 0;
-    // Simple balance pan: centre keeps both channels at full level.
     s.panL = 1 - Math.max(0, p);
     s.panR = 1 + Math.min(0, p);
 
@@ -257,7 +268,6 @@ class PcmMixer extends AudioWorkletProcessor {
     s.catchup = Number.isFinite(cfg.catchup) ? cfg.catchup : 25;
   }
 
-  /** Largest configured target among streams that are actually running. */
   computeNeed() {
     let need = 0;
     let active = 0;
@@ -276,13 +286,6 @@ class PcmMixer extends AudioWorkletProcessor {
     return own;
   }
 
-  /**
-   * Re-evaluate every stream after a target/balance change.
-   *
-   * A higher target pauses playback so the buffer can fill immediately.
-   * A lower target is NOT cut: the per-device catch-up speed gradually
-   * consumes the surplus, which avoids the click/noise of dropping samples.
-   */
   retargetAll() {
     const { need } = this.computeNeed();
     const tol = Math.round(sampleRate * 0.01);
@@ -290,11 +293,7 @@ class PcmMixer extends AudioWorkletProcessor {
     for (const s of this.streams.values()) {
       const next = this.targetFor(s, need);
       const prev = s.effTarget || 0;
-
-      if (next > prev + tol && s.playing && s.count < next) {
-        s.playing = false;
-      }
-
+      if (next > prev + tol && s.playing && s.count < next) s.playing = false;
       s.effTarget = next;
       s.targetSamples = next;
     }
@@ -308,7 +307,6 @@ class PcmMixer extends AudioWorkletProcessor {
     s.id = id;
     s.mic = id.endsWith('#mic');
     s.phoneId = s.mic ? id.slice(0, -4) : id;
-    // Defaults before the first set-phone message arrives.
     s.mainGain = 1;
     s.micGain = 1;
     s.gain = 1;
@@ -325,16 +323,48 @@ class PcmMixer extends AudioWorkletProcessor {
   receive(msg) {
     const id = msg.id == null ? 'default' : String(msg.id);
     const s = this.streamFor(id);
-    if (Number.isFinite(msg.gain)) {
-      // The frame gain is the per-device main gain; mic gain is applied by
-      // applyStreamConfig so it is never counted twice.
-      s.mainGain = Math.max(0, Math.min(3, msg.gain));
-      s.gain = s.mainGain * (s.mic ? s.micGain : 1);
+
+    // The per-frame gain is only a fallback.  Once the volume slider sent an
+    // explicit "set-phone", that value must win, otherwise every frame would
+    // undo the slider (this was why the sliders appeared dead).
+    if (Number.isFinite(msg.gain) && !s.hasCfgGain) {
+      const g = Math.max(0, Math.min(3, msg.gain));
+      if (g !== s.mainGain) {
+        s.mainGain = g;
+        s.gain = s.mainGain * (s.mic ? s.micGain : 1);
+      }
     }
+
     s.idleFrames = 0;
     s.dead = false;
+    const gap = s.lastReceiveBlock > 0 ? this.blocks - s.lastReceiveBlock : 0;
+    s.lastReceiveBlock = this.blocks;
     s.lastPushBlock = this.blocks;
+    // A long silence gap leaves stale samples in the ring buffer.
+    if (s.started && gap > Math.round(sampleRate * 0.25)) this.resetBuffer(s);
     this.receivePcm(s, msg.pcm, msg.rate || 48000, msg.channels || 1);
+  }
+
+  /** Drop buffered audio and restart cleanly. */
+  resetBuffer(s) {
+    s.count = 0;
+    s.readPos = 0;
+    s.writePos = 0;
+    s.readFrac = 0;
+    s.step = 1;
+    s.playing = false;
+    s.prevL = 0;
+    s.prevR = 0;
+    s.nrFilter.reset();
+    s.lastOutL = 0;
+    s.lastOutR = 0;
+    s.holdL = 0;
+    s.holdR = 0;
+    s.shortUnderruns = 0;
+    s.fadeLeft = 0;
+    s.env = 0;
+    s.peakRef = 0;
+    s.boostEnv = 1;
   }
 
   receivePcm(s, pcm, rate, channels) {
@@ -342,7 +372,6 @@ class PcmMixer extends AudioWorkletProcessor {
     if (!Number.isInteger(n) || n <= 0) return;
 
     if (rate !== s.prevRate) {
-      // reset continuity when this phone changes format
       s.prevRate = rate;
       s.prevL = 0;
       s.prevR = 0;
@@ -398,8 +427,6 @@ class PcmMixer extends AudioWorkletProcessor {
     s.writePos = (s.writePos + 1) % s.cap;
     s.count++;
     s.pushed++;
-    // The 750 ms emergency cut is handled in process(), where a short
-    // declick ramp can be applied.  Never drop audio here.
   }
 
   process(inputs, outputs) {
@@ -418,22 +445,19 @@ class PcmMixer extends AudioWorkletProcessor {
       s.targetSamples = target;
       s.effTarget = target;
 
-      // If we are already playing but the target has moved up (balance or
-      // extra margin), re-buffer instead of drifting below it for ages.
       const deficit = Math.round(sampleRate * 0.04);
       if (s.playing && s.count < target - deficit) s.playing = false;
 
       if (!s.playing) {
-        // No audio is being emitted, so resetting the rate here is inaudible
-        // and prevents a high catch-up speed from leaking into the resume.
         s.step = 1;
+        s.readFrac = 0;
         if (s.count >= target) {
           s.playing = true;
           s.lastUnderrunBlock = this.blocks;
-          s.fadeTotal = Math.max(1, Math.round(sampleRate * 0.003));
+          // 20 ms raised-cosine fade: no step at the start of playback.
+          s.fadeTotal = Math.max(1, Math.round(sampleRate * 0.02));
           s.fadeLeft = s.fadeTotal;
         } else {
-          // No audio yet: forget the stream if it has been quiet for a while.
           s.idleFrames++;
           if (s.idleFrames > 400) {
             s.dead = true;
@@ -444,14 +468,10 @@ class PcmMixer extends AudioWorkletProcessor {
         }
       }
 
-      // Emergency stop: only when the real buffer exceeds 750 ms.  Drop back
-      // to the target and ramp from the last output sample for 1.5 ms, so the
-      // cut does not click.
+      // Emergency trim only above 750 ms; the per-stream speed handles the rest.
       if (s.count > this.maxBufferSamples) {
         const drop = Math.min(s.count - target, s.count - 1);
         if (drop > 0) {
-          s.declickLeft = Math.max(1, Math.round(sampleRate * 0.0015));
-          s.declickTotal = s.declickLeft;
           s.readPos = (s.readPos + drop) % s.cap;
           s.count -= drop;
           s.dropped += drop;
@@ -463,6 +483,51 @@ class PcmMixer extends AudioWorkletProcessor {
       const gl = s.mic ? s.panL : 1;
       const gr = s.mic ? s.panR : 1;
 
+      // Block-level expander for the per-phone boost.
+      //
+      // Raising one phone above 100 % multiplies the whole stream, so any
+      // noise baked into the phone's PCM (codec hiss, device noise floor)
+      // grows with it.  This measures the block once, then applies a slowly
+      // smoothed gain: quiet blocks stay at 1.0, loud blocks get the full
+      // boost.  It runs per block, never per sample, so it cannot modulate
+      // the waveform (that produced the earlier low-frequency hum).
+      let blockBoost = g;
+      if (g > 1.0001) {
+        let peak = 0;
+        for (let i = 0; i < left.length; i++) {
+          const idx = (s.readPos + i) % s.cap;
+          const a = Math.abs(s.bufL[idx]);
+          const b = Math.abs(s.bufR[idx]);
+          if (a > peak) peak = a;
+          if (b > peak) peak = b;
+        }
+        // Envelope: fast attack, slow release, in normalised amplitude.
+        s.env += (peak - s.env) * (peak > s.env ? 0.25 : 0.02);
+        // Recent loudest block, decaying slowly: a relative reference that
+        // adapts to whatever level this phone is actually sending.
+        s.peakRef = Math.max(peak, s.peakRef * 0.9995);
+
+        // Relative gate: blocks that are more than ~26 dB below the recent
+        // peak are treated as background and stay at unity gain.  Music at
+        // any level clears the threshold, so raising the volume never lifts
+        // the hiss that sits below it.
+        const rel = s.peakRef > 1e-6 ? s.env / s.peakRef : 1;
+        const lowGate = 0.05;   // -26 dB
+        const highGate = 0.16;  // -16 dB
+        let target;
+        if (rel <= lowGate) target = 1;
+        else if (rel >= highGate) target = g;
+        else target = 1 + (g - 1) * ((rel - lowGate) / (highGate - lowGate));
+
+        // Fast enough to follow real audio, slow enough to stay inaudible.
+        s.boostEnv += (target - s.boostEnv) * 0.15;
+        blockBoost = s.boostEnv;
+      } else {
+        s.boostEnv = g;
+      }
+
+      const boostMul = blockBoost;
+
       for (let i = 0; i < left.length; i++) {
         if (s.count > 1) {
           const i0 = s.readPos;
@@ -470,28 +535,24 @@ class PcmMixer extends AudioWorkletProcessor {
           const f = s.readFrac;
           const l = s.bufL[i0] + (s.bufL[i1] - s.bufL[i0]) * f;
           const r = s.bufR[i0] + (s.bufR[i1] - s.bufR[i0]) * f;
-          let outL = l * g * gl;
-          let outR = r * g * gr;
+          let outL = l * boostMul * gl;
+          let outR = r * boostMul * gr;
 
           if (s.fadeLeft > 0) {
-            const fade = 1 - s.fadeLeft / s.fadeTotal;
+            const k = 1 - s.fadeLeft / s.fadeTotal;
+            const fade = 0.5 - 0.5 * Math.cos(Math.PI * k);
             outL *= fade;
             outR *= fade;
             s.fadeLeft--;
-          }
-
-          if (s.declickLeft > 0) {
-            // Continue from the last emitted sample into the new position.
-            const k = 1 - s.declickLeft / s.declickTotal;
-            outL = s.lastOutL + (outL - s.lastOutL) * k;
-            outR = s.lastOutR + (outR - s.lastOutR) * k;
-            s.declickLeft--;
           }
 
           left[i] += outL;
           right[i] += outR;
           s.lastOutL = outL;
           s.lastOutR = outR;
+          s.holdL = outL;
+          s.holdR = outR;
+          s.started = true;
           const p = Math.max(Math.abs(outL), Math.abs(outR));
           if (p > s.peak) s.peak = p;
 
@@ -501,43 +562,52 @@ class PcmMixer extends AudioWorkletProcessor {
             s.readPos = (s.readPos + 1) % s.cap;
             s.count--;
           }
-        } else if (!underrun) {
-          s.underruns++;
-          underrun = true;
+        } else {
+          // Starved: hold the last output value with a decay so the gap fades
+          // instead of snapping to zero.  The immediate jump from a non-zero
+          // sample to silence was audible as a click on every dropped packet.
+          s.holdL *= 0.985;
+          s.holdR *= 0.985;
+          left[i] += s.holdL;
+          right[i] += s.holdR;
+          if (!underrun) {
+            s.underruns++;
+            underrun = true;
+          }
         }
       }
 
       if (underrun) {
-        s.playing = false;
-        s.lastUnderrunBlock = this.blocks;
-        s.extra = Math.min(this.maxExtra, s.extra + this.extraStep);
-      } else if (this.blocks - s.lastUnderrunBlock > 200) {
-        // Stable for ~1.1 s: slowly remove the temporary safety margin.
-        if (s.extra > 0) {
-          s.extra = Math.max(0, s.extra - Math.round(sampleRate * 0.005));
+        // Short starvation (a dropped packet) should not tear down playback:
+        // stopping and re-buffering the whole target is what produced the
+        // audible gaps and the burst when it resumed.  Keep the stream
+        // running and let the resampler coast on the last samples.
+        s.shortUnderruns = (s.shortUnderruns || 0) + 1;
+        s.extra = Math.min(this.maxExtra, s.extra + Math.round(this.extraStep * 0.5));
+        if (s.shortUnderruns > this.maxShortUnderruns) {
+          s.playing = false;
+          s.shortUnderruns = 0;
         }
         s.lastUnderrunBlock = this.blocks;
+      } else {
+        s.shortUnderruns = 0;
+        if (this.blocks - s.lastUnderrunBlock > 200) {
+          if (s.extra > 0) s.extra = Math.max(0, s.extra - Math.round(sampleRate * 0.005));
+          s.lastUnderrunBlock = this.blocks;
+        }
       }
 
-      // Continuous, per-device catch-up speed.
-      //
-      // 0..100 maps to 1.005x..1.15x.  Above 60 ms of surplus the chosen
-      // speed is used in full; below that the target speed eases back to 1.0
-      // *before* reaching the target.  A slew limit prevents any abrupt
-      // "double speed" step, so the pitch change is always gradual.
+      // Gentle catch-up: keeps the buffer near target without pitch jumps.
       const excess = s.count - target;
       const ramp = Math.round(sampleRate * 0.06);
       const level = Math.max(0, Math.min(100, s.catchup == null ? 25 : s.catchup));
       const maxRate = 1.005 + 0.145 * (level / 100) * (level / 100);
       let desired = 1;
       if (excess > Math.round(sampleRate * 0.002)) {
-        desired = excess >= ramp
-          ? maxRate
-          : 1 + (maxRate - 1) * (excess / ramp);
+        desired = excess >= ramp ? maxRate : 1 + (maxRate - 1) * (excess / ramp);
       } else if (excess < -Math.round(sampleRate * 0.01)) {
         desired = 0.995;
       }
-
       const slew = 0.002;
       if (desired > s.step + slew) s.step += slew;
       else if (desired < s.step - slew) s.step -= slew;
@@ -545,10 +615,11 @@ class PcmMixer extends AudioWorkletProcessor {
       s.step = Math.max(0.99, Math.min(1.15, s.step));
     }
 
-    // Soft limiter: keeps several simultaneous phones from clipping.
+    // Plain hard limit: transparent below full scale, so normal playback is
+    // untouched.  No soft-knee curve, no envelope.
     for (let i = 0; i < left.length; i++) {
-      left[i] = softClip(left[i]);
-      right[i] = softClip(right[i]);
+      left[i] = hardClip(left[i]);
+      right[i] = hardClip(right[i]);
       const p = Math.max(Math.abs(left[i]), Math.abs(right[i]));
       if (p > this.outPeak) this.outPeak = p;
     }
@@ -573,9 +644,6 @@ class PcmMixer extends AudioWorkletProcessor {
     const { active } = this.computeNeed();
 
     for (const [id, s] of this.streams) {
-      // Purge streams whose owner is gone (no frames for >4 s). The browser
-      // can unload a page or a phone can vanish without a JSON event, and
-      // stale streams would otherwise keep pumping garbage into the speaker.
       if (s.playing && s.count > 0 && s.lastPushBlock > 0 && this.blocks - s.lastPushBlock > 300) {
         this.streams.delete(id);
         this.port.postMessage({ type: 'gone', id });
@@ -595,6 +663,7 @@ class PcmMixer extends AudioWorkletProcessor {
       phones.push({
         id,
         peak,
+        gain: s.gain,
         bufferMs: (s.count / sampleRate) * 1000,
         targetMs: (s.targetSamples / sampleRate) * 1000,
         playing: s.playing,
@@ -624,16 +693,20 @@ class PcmMixer extends AudioWorkletProcessor {
   }
 }
 
-/* Local PC microphone monitor: same high-pass / adaptive gate as phone mic
- * streams, followed by a soft limiter.  The gain node sits before this
- * processor, so boosting the monitor up to 300% is still clipped smoothly. */
+/* Local PC microphone monitor.  Volume is applied after this node, so the
+ * gate always sees the unscaled microphone signal. */
 class PcmMonitor extends AudioWorkletProcessor {
   constructor() {
     super();
     this.filter = new MicNoiseFilter();
+    this.enabled = true;
     this.port.onmessage = (event) => {
       const msg = event.data || {};
       if (msg.type === 'config') this.filter.setStrength(msg.nr);
+      if (msg.type === 'enable') {
+        this.enabled = msg.on !== false;
+        if (!this.enabled) this.filter.reset();
+      }
     };
   }
 
@@ -642,6 +715,7 @@ class PcmMonitor extends AudioWorkletProcessor {
     if (!out || !out[0]) return true;
     out[0].fill(0);
     if (out[1]) out[1].fill(0);
+    if (!this.enabled) return true;
 
     const input = inputs[0];
     if (!input || !input[0]) return true;
@@ -652,8 +726,8 @@ class PcmMonitor extends AudioWorkletProcessor {
 
     for (let i = 0; i < left.length; i++) {
       const y = this.filter.process(left[i], right[i]);
-      outL[i] = softClip(y[0]);
-      outR[i] = softClip(y[1]);
+      outL[i] = hardClip(y[0]);
+      outR[i] = hardClip(y[1]);
     }
     return true;
   }
